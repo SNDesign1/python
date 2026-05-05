@@ -2,6 +2,12 @@ from http.server import SimpleHTTPRequestHandler, HTTPServer
 import subprocess 
 import socket
 import json
+import importlib.util 
+import sys
+
+if importlib.util.find_spec("psutil") is None:
+    subprocess.check_call([sys.executable, "-m", "pip", "psutil"])
+
 import psutil
 
 PORT = 8080
