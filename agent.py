@@ -2,15 +2,21 @@ from http.server import SimpleHTTPRequestHandler, HTTPServer
 import subprocess 
 import socket
 import json
-import importlib.util 
 import sys
+import os
+import importlib.util
 
-if importlib.util.find_spec("psutil") is None:
-    subprocess.check_call([sys.executable, "-m", "pip", "psutil"])
+def isAvailable(module_name):
+    return importlib.util.find_spec(module_name) is not None
 
-import psutil
+if isAvailable("obswebsocket"):
+    from obswebsocket import obsws, requests
+
+if sys.platform == "linux":
+    import signal
 
 PORT = 8080
+OBS_PORT = 4455
 
 class Handler(SimpleHTTPRequestHandler):
     processes = {}
@@ -18,8 +24,60 @@ class Handler(SimpleHTTPRequestHandler):
     def getIpAddress(self) -> str:
         return socket.gethostbyname(socket.gethostname())
 
+
+    def isPortUsed(self, port): 
+        try:
+            s = socket.create_connection((self.getIpAddress(), port), timeout=1)
+            s.close()
+            return True
+        except (ConnectionRefusedError, OSError):
+            return False
+
     def do_POST(self):
         try:
+            if self.path == "/obs":
+                if isAvailable("obswebsocket") == False:
+                    raise Exception("module missing: pip install obs-websocket-py")
+
+                contentLength = self.headers["Content-Length"]
+                if contentLength == None:
+                    raise Exception("missing body")
+                
+                length = int(contentLength)
+                body = self.rfile.read(length).decode()
+                body = json.loads(body)
+
+                if "scene" not in body:
+                    raise Exception("post missing 'scene':")
+
+                scene = body["scene"]
+
+                if self.isPortUsed(OBS_PORT):
+                    ws = obsws(self.getIpAddress(), OBS_PORT)
+                    ws.connect()
+                    ws.call(requests.SetCurrentProgramScene(sceneName=scene))
+                    ws.disconnect()
+                else:
+                    if "exe" not in body:
+                        raise Exception("exe not contained in body and obs not open")
+
+                    exe = body["exe"]
+                    exeDir = os.path.dirname(exe)
+                    process = subprocess.Popen([exe, "--scene", scene], cwd=exeDir) # launches from obs' dir
+                    pId = process.pid
+
+                    Handler.processes[pId] = exe
+                    print(f"launched obs {pId}")
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+
+                self.wfile.write(json.dumps({
+                    "IpAddress": self.getIpAddress()
+                    }).encode())
+                self.wfile.flush()
+
             if self.path == "/launch":
                 contentLength = self.headers["Content-Length"]
                 if contentLength == None:
@@ -28,10 +86,6 @@ class Handler(SimpleHTTPRequestHandler):
                 length = int(contentLength)
                 body = self.rfile.read(length).decode()
                 body = json.loads(body)
-
-                pName = None
-                if "name" in body:
-                    pName = body["name"]
 
                 if "exe" not in body:
                     raise Exception("post missing 'exe'")
@@ -42,19 +96,11 @@ class Handler(SimpleHTTPRequestHandler):
                 if "args" in body:
                     args = body["args"]
 
-                pipeArgs = []
-                pipeArgs.append(exe)
-
-                if len(args) > 0:
-                    pipeArgs = pipeArgs + args
-
-                process = subprocess.Popen(pipeArgs)
+                process = subprocess.Popen([exe] + args)
                 pId = process.pid
 
-                if psutil.pid_exists(pId) == False:
-                    raise Exception("failed to create valid process")
-
-                Handler.processes[pId] = pName
+                Handler.processes[pId] = exe
+                print(f"Created process {pId} {exe} {args}")
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -63,25 +109,21 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({
                     "IpAddress": self.getIpAddress(),
                     "ProcessId": pId,
-                    "ProcessName": pName
+                    "ProcessExe": exe
                     }).encode())
                 self.wfile.flush()
 
             if self.path == "/kill": 
-                killedProcesses = []
-                failedProcesses = []
-
                 contentLength = self.headers["Content-Length"]
-                if contentLength == None:
+                if contentLength == None or int(contentLength) == 0:
                     for pId in list(Handler.processes): 
-                        process = psutil.Process(pId)
-                        process.kill()
-                                                
-                        if psutil.pid_exists(pId) == False:
-                            killedProcesses.append(pId)
-                            del Handler.processes[pId]
+                        if sys.platform == "win32":
+                            subprocess.run(["taskkill", "/F", "/IM", os.path.basename(Handler.processes[pId]), "/T"], capture_output=True)
                         else:
-                            failedProcesses.append(pId)
+                            os.killpg(os.getpgid(pId), signal.SIGTERM)
+
+                        del Handler.processes[pId]
+                        print(f"Killing {pId}")
                 else:
                     length = int(contentLength)
                     body = self.rfile.read(length).decode()
@@ -89,26 +131,21 @@ class Handler(SimpleHTTPRequestHandler):
 
                     if "pId" in body:
                         pId = body["pId"]
-                        process = psutil.Process(pId)
-                        process.kill()
-                                                
-                        if psutil.pid_exists(pId) == False:
-                            killedProcesses.append(pId)
-                            del Handler.processes[pId]
-                        else:
-                            failedProcesses.append(pId)
 
-                for fProcess in failedProcesses:
-                    del Handler.processes[fProcess]
-                    
+                        if sys.platform == "win32":
+                            subprocess.run(["taskkill", "/F", "/IM", os.path.basename(Handler.processes[pId]), "/T"], capture_output=True)
+                        else:
+                            os.killpg(os.getpgid(pId), signal.SIGTERM)
+
+                        del Handler.processes[pId]
+                        print(f"Killing {pId}")
+
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
 
                 self.wfile.write(json.dumps({
-                    "IpAddress": self.getIpAddress(),
-                    "KilledProcesses": killedProcesses,
-                    "FailedProcesses": failedProcesses
+                    "IpAddress": self.getIpAddress()
                     }).encode())
                 self.wfile.flush()
 
@@ -138,10 +175,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 
-                for pId in list(Handler.processes):
-                    if psutil.pid_exists(pId) == False:
-                        del Handler.processes[pId]
-
                 self.wfile.write(json.dumps({
                         "IpAddress": self.getIpAddress(),
                         "Processes": Handler.processes,
@@ -167,9 +200,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.flush()
 
 
-    
 IpAddress = socket.gethostbyname(socket.gethostname())
 
 with HTTPServer((IpAddress, PORT), Handler) as server:
    print(f"listening -- {socket.gethostname()} -- {IpAddress} -- {PORT}") 
-   server.serve_forever() 
+   server.serve_forever()
